@@ -1,0 +1,26 @@
+#------------------------WORT TEMPERATURE SETPOINT-----------------------(ADD TO MAITHA'S CODE)
+# Create a wort temperature setpoint array:
+# currently disregarding crash cooling
+
+t = np.linspace(0,336,1500)
+Tset = np.zeros(len(t))
+
+for i in range(len(t)):
+    if t[i] < 48:
+        Tset[i] = 18
+    elif t[i] < 168:
+        Tset[i] = 20
+    elif t[i] < 240:
+        Tset[i] = 22
+    elif t[i] < 300:
+        Tset[i] = 18
+    else:
+        Tset[i] = 18 - (16/36) * (t[i] - 300)
+    
+plt.plot(t, Tset)
+plt.xlabel("Time (hours)")
+plt.ylabel("Temperature Setpoint (deg C)")
+plt.title("14-Day Ale Fermentation Temperature Profile without Crash Cooling")
+plt.show()
+
+Tset_func = interp1d(t, Tset, fill_value = "extrapolate")
