@@ -1,0 +1,430 @@
+# ============================================================
+#  FERMENTATION HEAT BALANCE  —  PID TEMPERATURE CONTROL
+#  Compares 1st-order and 2nd-order process representations
+#  with a continuous PID controller.
+#
+#  Controlled variable  : Wort temperature  (T_wort)
+#  Manipulated variable : Coolant flow rate (F_coolant_m3h)
+#  Disturbance          : +3 °C step at t = 40% of run (134.4 h)
+#
+#  PID law (continuous):
+#    u(t) = Kr*e(t) + (Kr/tauI)*I(t) + Kr*tauD*(dTset/dt - dT/dt)
+#    dI/dt = e(t)
+#
+#  For 2nd-order process the jacket temperature Tc is the
+#  second process state (as in the original heat balance).
+#  For 1st-order process Tc is solved algebraically at
+#  quasi-steady state, collapsing the jacket lag.
+# ============================================================
+
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+# ─────────────────────────────────────────────────────────────
+#  WORT TEMPERATURE SETPOINT  (same profile as original)
+# ─────────────────────────────────────────────────────────────
+duration = 336          # hr  (14 days)
+t_base   = np.linspace(0, duration, 3000)
+
+Tset_arr = np.zeros(len(t_base))
+for i, ti in enumerate(t_base):
+    if   ti < 48:   Tset_arr[i] = 18
+    elif ti < 168:  Tset_arr[i] = 20
+    elif ti < 240:  Tset_arr[i] = 22
+    elif ti < 300:  Tset_arr[i] = 18
+    else:           Tset_arr[i] = 18 - (16/36) * (ti - 300)
+
+Tset_func  = interp1d(t_base, Tset_arr, fill_value="extrapolate")
+# Derivative of setpoint (needed for PID derivative-on-error)
+dTset_arr  = np.gradient(Tset_arr, t_base)
+dTset_func = interp1d(t_base, dTset_arr, fill_value="extrapolate")
+
+# ─────────────────────────────────────────────────────────────
+#  DISTURBANCE  (same as original: +3 °C step in wort state)
+# ─────────────────────────────────────────────────────────────
+t_disturbance  = 0.40 * duration   # 134.4 h
+disturbance_dT = 3.0               # °C
+
+# ─────────────────────────────────────────────────────────────
+#  PHYSICAL & FERMENTATION PROPERTIES
+# ─────────────────────────────────────────────────────────────
+ethanol_density  = 789
+water_density_ref = 1000
+OG               = 1.048
+yeast_pitch_rate = 0.75
+yeast_density    = 40e-12
+
+volume           = 1200      # L  wort
+vessel_volume    = 1500      # L
+vessel_volume_m3 = vessel_volume / 1000
+temperature      = 18        # °C  initial
+temperature_K    = temperature + 273.15
+
+k_s   = 15.3;  k_e  = 6.31;  S_min = 13.1
+g_x   = 0.0167; k_v  = 0.651; k_co2 = 3.71
+a_MB  = 0.4;   b_MB = -1.1;  c_MB  = 0.025;  d_MB = -0.056
+
+degP             = (-616.868) + (1111.14*OG) - (630.272*OG**2) + (135.997*OG**3)
+wort_density_MB  = OG * water_density_ref
+s_calc           = (degP/100) * wort_density_MB
+yeast_req        = yeast_pitch_rate * (volume * 1000) * degP * 1e6
+mass_yeast       = yeast_req * yeast_density
+yeast_conc       = mass_yeast / volume
+
+T_water_in    = 10
+T_water_in_K  = T_water_in + 273.15
+water_density = (999.80 + 992.30) / 2
+water_Cp      = 4.1789          # kJ/kg K
+wort_density  = (1048 + 1005) / 2
+wort_Cp       = 4.0585          # kJ/kg K
+
+U      = 50
+U_hr   = U * 3600               # J/m² K hr  → kJ/m² K hr  (×3.6)
+delta_H = -587                  # kJ/kg substrate
+Area   = 0.3 * 14.137 / 2      # m²
+V_wort_m3 = volume / 1000
+V_jacket  = vessel_volume_m3 * 0.05
+
+# ─────────────────────────────────────────────────────────────
+#  PID CONTROLLER PARAMETERS
+#  Tuned for temperature control; Kr < 0 because increasing
+#  coolant flow lowers temperature (reverse-acting).
+# ─────────────────────────────────────────────────────────────
+Kr   = -0.04   # m³/hr per °C   (controller gain — reverse acting)
+tauI = 6.0      # hr             (integral time constant)
+tauD = 1.5      # hr             (derivative time constant)
+
+# Coolant flow bounds  [m³/hr]
+F_min = 0.001   # minimum flow (never fully off)
+F_max = 0.10    # maximum flow (valve fully open)
+
+print("=" * 60)
+print("  FERMENTATION PID TEMPERATURE CONTROL")
+print("=" * 60)
+print(f"  Kr   = {Kr}  m³/hr·°C  (reverse-acting)")
+print(f"  tauI = {tauI}  hr")
+print(f"  tauD = {tauD}  hr")
+print(f"  F_coolant ∈ [{F_min*1000:.1f}, {F_max*1000:.0f}] L/hr")
+print(f"  Disturbance: +{disturbance_dT} °C at t = {t_disturbance:.1f} h\n")
+
+# ─────────────────────────────────────────────────────────────
+#  BIOMASS GROWTH RATE
+# ─────────────────────────────────────────────────────────────
+def mu_x(s, S_min, mu_max_T):
+    return mu_max_T * (1 - S_min / s) if s >= S_min else 0.0
+
+# ─────────────────────────────────────────────────────────────
+#  PID COOLANT FLOW CALCULATION  (shared helper)
+# ─────────────────────────────────────────────────────────────
+def pid_flow(T, dT_dt, I_pid, t):
+    """Return clamped coolant flow rate [m³/hr] from PID law."""
+    Tset    = Tset_func(t)
+    dTset_dt = dTset_func(t)
+    e       = Tset - (T - 273.15)            # error in °C
+    u = (Kr * e
+         + (Kr / tauI) * I_pid
+         + Kr * tauD * (dTset_dt - dT_dt))
+    return float(np.clip(u, F_min, F_max))
+
+# ─────────────────────────────────────────────────────────────
+#  ODE — 2nd ORDER PROCESS  (jacket dynamics retained)
+#  States: [x, s, e, co2, vdk, T_wort_K, Tc_K, I_pid]
+# ─────────────────────────────────────────────────────────────
+def ODE_2nd(t, state):
+    x, s, e_ferm, co2, vdk, T, Tc, I_pid = state
+
+    # ── Fermentation kinetics ──────────────────────────────
+    T_C      = T - 273.15
+    mu_max_T = a_MB * np.log(T_C) + b_MB
+    r_vdk_T  = c_MB * np.log(T_C) + d_MB
+    mu       = mu_x(s, S_min, mu_max_T)
+
+    dx_dt    = (mu * x) - (g_x * x)
+    ds_dt    = -k_s * mu * x
+    de_dt    =  k_e * mu * x
+    dco2_dt  =  k_co2 * mu * x
+    dvdk_dt  =  k_v * mu * x - r_vdk_T * vdk
+
+    # ── Wort heat balance ──────────────────────────────────
+    UA_over_mCp = (Area * U_hr
+                   / (V_wort_m3 * wort_density * wort_Cp * 1000))
+    dT_dt = ((ds_dt * delta_H / (wort_density * wort_Cp))
+             - UA_over_mCp * (T - Tc))
+
+    # ── PID controller → coolant flow ─────────────────────
+    F_cool = pid_flow(T, dT_dt, I_pid, t)
+
+    # ── Jacket heat balance ────────────────────────────────
+    UA_jk  = Area * U_hr / (V_jacket * water_density * water_Cp * 1000)
+    dTc_dt = ((F_cool / V_jacket) * (T_water_in_K - Tc)
+              + UA_jk * (T - Tc))
+
+    # ── PID integral state ─────────────────────────────────
+    Tset_K = Tset_func(t) + 273.15
+    dI_dt  = (Tset_K - T)                   # de/dt integrand (in K)
+
+    return [dx_dt, ds_dt, de_dt, dco2_dt, dvdk_dt, dT_dt, dTc_dt, dI_dt]
+
+# ─────────────────────────────────────────────────────────────
+#  ODE — 1st ORDER PROCESS  (jacket at quasi-steady-state)
+#  States: [x, s, e, co2, vdk, T_wort_K, I_pid]
+#  Tc is resolved algebraically at each step.
+# ─────────────────────────────────────────────────────────────
+def ODE_1st(t, state):
+    x, s, e_ferm, co2, vdk, T, I_pid = state
+
+    # ── Fermentation kinetics ──────────────────────────────
+    T_C      = T - 273.15
+    mu_max_T = a_MB * np.log(T_C) + b_MB
+    r_vdk_T  = c_MB * np.log(T_C) + d_MB
+    mu       = mu_x(s, S_min, mu_max_T)
+
+    dx_dt   = (mu * x) - (g_x * x)
+    ds_dt   = -k_s * mu * x
+    de_dt   =  k_e * mu * x
+    dco2_dt =  k_co2 * mu * x
+    dvdk_dt =  k_v * mu * x - r_vdk_T * vdk
+
+    # ── PID controller → coolant flow ─────────────────────
+    # Approximate dT/dt = 0 for initial flow estimate
+    F_cool = pid_flow(T, 0.0, I_pid, t)
+
+    # ── Quasi-steady-state Tc:  dTc/dt ≈ 0
+    #    (F/V)*(Tin - Tc) + (UA/mCp_jk)*(T - Tc) = 0
+    #    Tc = [ (F/V)*Tin + (UA/mCp_jk)*T ] / [ F/V + UA/mCp_jk ]
+    UA_jk   = Area * U_hr / (V_jacket * water_density * water_Cp * 1000)
+    ratio   = F_cool / V_jacket
+    Tc      = (ratio * T_water_in_K + UA_jk * T) / (ratio + UA_jk)
+
+    # ── Wort heat balance ──────────────────────────────────
+    UA_wort = Area * U_hr / (V_wort_m3 * wort_density * wort_Cp * 1000)
+    dT_dt   = ((ds_dt * delta_H / (wort_density * wort_Cp))
+               - UA_wort * (T - Tc))
+
+    # ── PID integral state ─────────────────────────────────
+    dI_dt = Tset_func(t) + 273.15 - T
+
+    return [dx_dt, ds_dt, de_dt, dco2_dt, dvdk_dt, dT_dt, dI_dt]
+
+# ─────────────────────────────────────────────────────────────
+#  TWO-SEGMENT SIMULATION RUNNER
+# ─────────────────────────────────────────────────────────────
+def run_simulation(ODE_func, y0, n_states):
+    """Run two-segment integration; return (t, y_out)."""
+    n1 = int(2000 * (t_disturbance / duration))
+    n2 = 2000 - n1
+    t1 = np.linspace(0, t_disturbance, n1)
+    t2 = np.linspace(t_disturbance, duration, n2)
+
+    sol1 = solve_ivp(ODE_func, (0, t_disturbance), y0,
+                     t_eval=t1, method='BDF', max_step=0.1,
+                     rtol=1e-5, atol=1e-7)
+    if not sol1.success:
+        raise RuntimeError(f"Segment 1 failed: {sol1.message}")
+
+    y_d = sol1.y[:, -1].copy()
+    y_d[5] += disturbance_dT          # inject +3 K into T_wort (index 5)
+
+    sol2 = solve_ivp(ODE_func, (t_disturbance, duration), y_d,
+                     t_eval=t2, method='BDF', max_step=0.1,
+                     rtol=1e-5, atol=1e-7)
+    if not sol2.success:
+        raise RuntimeError(f"Segment 2 failed: {sol2.message}")
+
+    t_out = np.concatenate([sol1.t,       sol2.t[1:]])
+    y_out = np.concatenate([sol1.y,       sol2.y[:, 1:]], axis=1)
+    return t_out, y_out, sol1
+
+# ─────────────────────────────────────────────────────────────
+#  RECONSTRUCT COOLANT FLOW FROM SAVED STATES
+# ─────────────────────────────────────────────────────────────
+def reconstruct_flow_2nd(t_out, y_out):
+    T_arr  = y_out[5]
+    Tc_arr = y_out[6]
+    I_arr  = y_out[7]
+    F_arr  = np.zeros(len(t_out))
+    for i in range(len(t_out)):
+        # estimate dT/dt ≈ 0 for flow reconstruction (small effect)
+        F_arr[i] = pid_flow(T_arr[i], 0.0, I_arr[i], t_out[i])
+    return F_arr
+
+def reconstruct_flow_1st(t_out, y_out):
+    T_arr = y_out[5]
+    I_arr = y_out[6]
+    F_arr = np.zeros(len(t_out))
+    for i in range(len(t_out)):
+        F_arr[i] = pid_flow(T_arr[i], 0.0, I_arr[i], t_out[i])
+    return F_arr
+
+# ─────────────────────────────────────────────────────────────
+#  RUN BOTH SIMULATIONS
+# ─────────────────────────────────────────────────────────────
+# 2nd-order initial state: [x, s, e, co2, vdk, T_K, Tc_K, I_pid]
+y0_2nd = [yeast_conc, s_calc, 0.0, 0.0, 0.0,
+          temperature_K, T_water_in_K, 0.0]
+
+# 1st-order initial state: [x, s, e, co2, vdk, T_K, I_pid]
+y0_1st = [yeast_conc, s_calc, 0.0, 0.0, 0.0,
+          temperature_K, 0.0]
+
+print("Running 2nd-order (jacket dynamics) simulation …")
+t2nd, y2nd, sol1_2nd = run_simulation(ODE_2nd, y0_2nd, 8)
+print("  ✓  Complete")
+
+print("Running 1st-order (quasi-steady jacket) simulation …")
+t1st, y1st, sol1_1st = run_simulation(ODE_1st, y0_1st, 7)
+print("  ✓  Complete\n")
+
+# ─────────────────────────────────────────────────────────────
+#  EXTRACT OUTPUTS
+# ─────────────────────────────────────────────────────────────
+T2_C   = y2nd[5] - 273.15
+Tc2_C  = y2nd[6] - 273.15
+F2_lh  = reconstruct_flow_2nd(t2nd, y2nd) * 1000   # L/hr
+Tset2  = Tset_func(t2nd)
+dev2   = T2_C - Tset2
+
+T1_C   = y1st[5] - 273.15
+F1_lh  = reconstruct_flow_1st(t1st, y1st) * 1000   # L/hr
+Tset1  = Tset_func(t1st)
+dev1   = T1_C - Tset1
+
+# Common bio outputs from 2nd-order run
+s2   = y2nd[1]
+e2   = y2nd[2]
+vdk2 = y2nd[4]
+abv2 = (e2 / ethanol_density) * 100
+ppb2 = vdk2 * 1000
+
+# ─────────────────────────────────────────────────────────────
+#  PERFORMANCE METRICS
+# ─────────────────────────────────────────────────────────────
+def iae(dev):
+    return np.trapezoid(np.abs(dev), t2nd if len(dev)==len(t2nd) else t1st)
+
+i_d2 = np.searchsorted(t2nd, t_disturbance)
+i_d1 = np.searchsorted(t1st, t_disturbance)
+
+print("─── Performance metrics ─────────────────────────────────")
+print(f"{'Metric':<40}  {'2nd-order':>10}  {'1st-order':>10}")
+print(f"{'─'*40}  {'─'*10}  {'─'*10}")
+print(f"{'IAE (full run), °C·hr':<40}  {iae(dev2):>10.2f}  {iae(dev1):>10.2f}")
+print(f"{'Max |deviation|, °C':<40}  {np.max(np.abs(dev2)):>10.3f}  {np.max(np.abs(dev1)):>10.3f}")
+post2 = dev2[i_d2:]; post1 = dev1[i_d1:]
+print(f"{'Post-disturbance max |dev|, °C':<40}  {np.max(np.abs(post2)):>10.3f}  {np.max(np.abs(post1)):>10.3f}")
+print(f"{'Mean F_coolant (L/hr)':<40}  {np.mean(F2_lh):>10.2f}  {np.mean(F1_lh):>10.2f}")
+print(f"{'Max  F_coolant (L/hr)':<40}  {np.max(F2_lh):>10.2f}  {np.max(F1_lh):>10.2f}")
+print()
+
+# ─────────────────────────────────────────────────────────────
+#  PLOTS
+# ─────────────────────────────────────────────────────────────
+col_2nd  = '#E8593C'
+col_1st  = '#3C88E8'
+col_set  = 'black'
+col_dist = 'grey'
+
+fig = plt.figure(figsize=(14, 16))
+gs  = gridspec.GridSpec(4, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+fig.suptitle(
+    "Fermentation PID Temperature Control\n"
+    f"Kr = {Kr} m³/hr·°C  |  τI = {tauI} hr  |  τD = {tauD} hr  |  "
+    f"+{disturbance_dT} °C disturbance at t = {t_disturbance:.0f} h",
+    fontsize=13, fontweight='bold', y=0.99
+)
+
+def vline(ax):
+    ax.axvline(t_disturbance, color=col_dist, linestyle=':', linewidth=1.2,
+               label=f'Disturbance  t = {t_disturbance:.0f} h')
+
+# ── A: Wort temperature — 2nd order ──────────────────────────
+ax = fig.add_subplot(gs[0, 0])
+ax.plot(t2nd, Tset2,  col_set,  lw=1.5, ls='--', label='Setpoint')
+ax.plot(t2nd, T2_C,   col_2nd,  lw=2.0, label='T_wort (2nd order)')
+ax.plot(t2nd, Tc2_C,  col_2nd,  lw=1.2, ls=':', alpha=0.7, label='T_jacket')
+vline(ax)
+ax.set_ylabel("Temperature (°C)"); ax.set_title("Wort Temperature — 2nd Order Process")
+ax.legend(fontsize=8, loc='lower center'); ax.grid(True, alpha=0.3)
+
+# ── B: Wort temperature — 1st order ──────────────────────────
+ax = fig.add_subplot(gs[0, 1])
+ax.plot(t1st, Tset1,  col_set,  lw=1.5, ls='--', label='Setpoint')
+ax.plot(t1st, T1_C,   col_1st,  lw=2.0, label='T_wort (1st order)')
+vline(ax)
+ax.set_ylabel("Temperature (°C)"); ax.set_title("Wort Temperature — 1st Order Process")
+#ax.legend(fontsize=8, loc='lower center'); ax.grid(True, alpha=0.3)
+
+# ── C: Temperature deviation comparison ──────────────────────
+ax = fig.add_subplot(gs[1, :])
+ax.plot(t2nd, dev2, col_2nd, lw=1.8, label='2nd-order deviation')
+ax.plot(t1st, dev1, col_1st, lw=1.8, ls='--', label='1st-order deviation')
+ax.axhline(0,  color='black', lw=0.8, ls='--')
+ax.fill_between(t2nd, dev2, 0, where=(dev2 > 0), color=col_2nd, alpha=0.15)
+ax.fill_between(t2nd, dev2, 0, where=(dev2 < 0), color=col_2nd, alpha=0.15)
+ax.fill_between(t1st, dev1, 0, where=(dev1 > 0), color=col_1st, alpha=0.10)
+ax.fill_between(t1st, dev1, 0, where=(dev1 < 0), color=col_1st, alpha=0.10)
+vline(ax)
+ax.set_ylabel("T_wort − Tset  (°C)")
+ax.set_title("Temperature Deviation from Setpoint  (1st vs 2nd Order)")
+ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+
+# ── D: Coolant flow — 2nd order ──────────────────────────────
+ax = fig.add_subplot(gs[2, 0])
+ax.plot(t2nd, F2_lh, col_2nd, lw=1.8, label='F_coolant (2nd order)')
+ax.axhline(F_min*1000, color='grey', ls=':', lw=1, label='F_min')
+ax.axhline(F_max*1000, color='grey', ls='-.', lw=1, label='F_max')
+vline(ax)
+ax.set_ylabel("Coolant Flow (L/hr)"); ax.set_title("Coolant Flow Rate — 2nd Order")
+ax.set_ylim(0, F_max*1000*1.15); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+# ── E: Coolant flow — 1st order ──────────────────────────────
+ax = fig.add_subplot(gs[2, 1])
+ax.plot(t1st, F1_lh, col_1st, lw=1.8, label='F_coolant (1st order)')
+ax.axhline(F_min*1000, color='grey', ls=':', lw=1, label='F_min')
+ax.axhline(F_max*1000, color='grey', ls='-.', lw=1, label='F_max')
+vline(ax)
+ax.set_ylabel("Coolant Flow (L/hr)"); ax.set_title("Coolant Flow Rate — 1st Order")
+ax.set_ylim(0, F_max*1000*1.15); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+# ── F: Fermentation outputs (common to both) ──────────────────
+ax = fig.add_subplot(gs[3, 0])
+ax2_twin = ax.twinx()
+ax.plot(t2nd, abv2, '#5cb85c', lw=2.0, label='ABV (%)')
+ax2_twin.plot(t2nd, ppb2, '#f0ad4e', lw=1.6, ls='--', label='VDK (ppb)')
+ax.set_xlabel("Time (h)"); ax.set_ylabel("ABV (%)", color='#5cb85c')
+ax2_twin.set_ylabel("VDK (ppb)", color='#f0ad4e')
+ax.set_title("Fermentation Outputs (2nd-order run)")
+ax.grid(True, alpha=0.3)
+lines1, lab1 = ax.get_legend_handles_labels()
+lines2, lab2 = ax2_twin.get_legend_handles_labels()
+ax.legend(lines1+lines2, lab1+lab2, fontsize=8, loc='center right')
+
+# ── G: Direct comparison zoom around disturbance ─────────────
+ax = fig.add_subplot(gs[3, 1])
+t_zoom_lo = t_disturbance - 10
+t_zoom_hi = t_disturbance + 60
+mask2 = (t2nd >= t_zoom_lo) & (t2nd <= t_zoom_hi)
+mask1 = (t1st >= t_zoom_lo) & (t1st <= t_zoom_hi)
+ax.plot(t2nd[mask2], T2_C[mask2],  col_2nd, lw=2.0, label='2nd order')
+ax.plot(t1st[mask1], T1_C[mask1],  col_1st, lw=2.0, ls='--', label='1st order')
+ax.plot(t2nd[mask2], Tset2[mask2], col_set, lw=1.4, ls=':', label='Setpoint')
+ax.axvline(t_disturbance, color=col_dist, ls=':', lw=1.2)
+ax.set_xlabel("Time (h)"); ax.set_ylabel("Temperature (°C)")
+ax.set_title("Disturbance Response  (zoomed ±10/+60 h)")
+ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+for a in fig.get_axes():
+    a.set_xlim(0, duration)
+
+fig.get_axes()[5].set_xlim(t_zoom_lo, t_zoom_hi)  # zoom panel
+fig.get_axes()[6].set_xlim(0, duration)
+
+#plt.savefig("/mnt/user-data/outputs/Heat_Balance_PID_Control.png",
+#            dpi=150, bbox_inches='tight')
+plt.show()
+
+print("─── Simulation complete ─────────────────────────────────")
